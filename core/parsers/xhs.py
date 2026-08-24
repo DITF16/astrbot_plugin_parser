@@ -1,8 +1,10 @@
-import json
 import re
+import asyncio
 from typing import Any, ClassVar
 
+import msgspec
 from msgspec import Struct, convert, field
+from aiohttp import TCPConnector
 
 from astrbot.api import logger
 
@@ -15,11 +17,19 @@ from .base import BaseParser, ParseException, Platform, handle
 class XHSParser(BaseParser):
     # 平台信息
     platform: ClassVar[Platform] = Platform(name="xhs", display_name="小红书")
+    
+    # 预编译正则，大幅提升大文本搜索速度
+    INITIAL_STATE_PATTERN: ClassVar[re.Pattern] = re.compile(r"window\.__INITIAL_STATE__=(.*?)</script>")
 
     def __init__(self, config: PluginConfig, downloader: Downloader):
         super().__init__(config, downloader)
         self.mycfg = config.parser.xhs
         self.cookies = self.mycfg.cookies
+        
+        # 性能优化：复用 TCP 连接池，减少小红书频繁的 TLS 握手开销
+        if not hasattr(self.session, "_connector") or self.session._connector is None:
+            self.session._connector = TCPConnector(limit=30, ttl_dns_cache=300, keepalive_timeout=30)
+
         self.headers.update(
             {
                 "accept": (
@@ -48,7 +58,6 @@ class XHSParser(BaseParser):
         url = f"https://{searched.group(0)}"
         return await self.parse_with_redirect(url, self.ios_headers)
 
-    # https://www.xiaohongshu.com/discovery/item/68e8e3fa00000000030342ec?app_platform=android&ignoreEngage=true&app_version=9.6.0&share_from_user_hidden=true&xsec_source=app_share&type=normal&xsec_token=CBW9rwIV2qhcCD-JsQAOSHd2tTW9jXAtzqlgVXp6c52Sw%3D&author_share=1&xhsshare=QQ&shareRedId=ODs3RUk5ND42NzUyOTgwNjY3OTo8S0tK&apptime=1761372823&share_id=3b61945239ac403db86bea84a4f15124&share_channel=qq
     @handle(
         "xiaohongshu.com",
         r"(explore|discovery/item)/(?P<query>(?P<xhs_id>[0-9a-zA-Z]+)\?[A-Za-z0-9._%&+=/#@-]+)",
@@ -57,22 +66,35 @@ class XHSParser(BaseParser):
         xhs_domain = "https://www.xiaohongshu.com"
         query, xhs_id = searched.group("query", "xhs_id")
 
+        # 终极优化：并发请求，但严格优先采用 explore (无水印) 的结果！
+        explore_task = asyncio.create_task(
+            self.parse_explore(f"{xhs_domain}/explore/{query}", xhs_id)
+        )
+        discovery_task = asyncio.create_task(
+            self.parse_discovery(f"{xhs_domain}/discovery/item/{query}")
+        )
+
         try:
-            return await self.parse_explore(f"{xhs_domain}/explore/{query}", xhs_id)
+            # 强制等待 explore 接口，因为我们要保证图片无水印
+            result = await explore_task
+            # 拿到无水印结果后，立刻取消备用任务释放资源
+            if not discovery_task.done():
+                discovery_task.cancel()
+            return result
         except Exception as e:
             logger.warning(
-                f"parse_explore failed, error: {e}, fallback to parse_discovery"
+                f"[小红书] explore (无水印) 接口解析失败 ({e})，降级使用 discovery 备用接口"
             )
-            return await self.parse_discovery(f"{xhs_domain}/discovery/item/{query}")
+            # 只有当 explore 失败时，才使用 discovery（此时 discovery 可能已经请求完毕，0延迟无缝切换）
+            return await discovery_task
 
     async def parse_explore(self, url: str, xhs_id: str):
         async with self.session.get(url, headers=self.headers) as resp:
             html = await resp.text()
-            logger.debug(f"url: {resp.url} | status: {resp.status}")
+            logger.debug(f"[小红书] explore url: {resp.url} | status: {resp.status}")
 
         json_obj = self._extract_initial_state_json(html)
 
-        # ["note"]["noteDetailMap"][xhs_id]["note"]
         note_data = (
             json_obj.get("note", {})
             .get("noteDetailMap", {})
@@ -118,17 +140,12 @@ class XHSParser(BaseParser):
         note_detail = convert(note_data, type=NoteDetail)
 
         contents = []
-        # 添加视频内容
         if video_url := note_detail.video_url:
-            # 使用第一张图片作为封面
             cover_url = note_detail.image_urls[0] if note_detail.image_urls else None
             contents.append(self.create_video_content(video_url, cover_url))
-
-        # 添加图片内容
         elif image_urls := note_detail.image_urls:
             contents.extend(self.create_image_contents(image_urls))
 
-        # 构建作者
         author = self.create_author(note_detail.nickname, note_detail.avatar_url)
 
         return self.result(
@@ -139,12 +156,9 @@ class XHSParser(BaseParser):
         )
 
     async def parse_discovery(self, url: str):
-        async with self.session.get(
-            url,
-            headers=self.ios_headers,
-            allow_redirects=True,
-        ) as resp:
+        async with self.session.get(url, headers=self.ios_headers, allow_redirects=True) as resp:
             html = await resp.text()
+            logger.debug(f"[小红书] discovery url: {resp.url} | status: {resp.status}")
 
         json_obj = self._extract_initial_state_json(html)
         note_data = json_obj.get("noteData")
@@ -170,7 +184,7 @@ class XHSParser(BaseParser):
             user: User
             time: int
             lastUpdateTime: int
-            imageList: list[Image] = []  # 有水印
+            imageList: list[Image] = field(default_factory=list)
             video: Video | None = None
 
             @property
@@ -186,7 +200,7 @@ class XHSParser(BaseParser):
         class NormalNotePreloadData(Struct):
             title: str
             desc: str
-            imagesList: list[Image] = []  # 无水印, 但只有一只，用于视频封面
+            imagesList: list[Image] = field(default_factory=list)
 
             @property
             def image_urls(self) -> list[str]:
@@ -201,7 +215,7 @@ class XHSParser(BaseParser):
                 img_urls = preload_data.image_urls
             else:
                 img_urls = note_data.image_urls
-            contents.append(self.create_video_content(video_url, img_urls[0]))
+            contents.append(self.create_video_content(video_url, img_urls[0] if img_urls else None))
         elif img_urls := note_data.image_urls:
             contents.extend(self.create_image_contents(img_urls))
 
@@ -214,13 +228,17 @@ class XHSParser(BaseParser):
         )
 
     def _extract_initial_state_json(self, html: str) -> dict[str, Any]:
-        pattern = r"window\.__INITIAL_STATE__=(.*?)</script>"
-        matched = re.search(pattern, html)
+        matched = self.INITIAL_STATE_PATTERN.search(html)
         if not matched:
-            raise ParseException("小红书分享链接失效或内容已删除")
+            raise ParseException("小红书分享链接失效或未找到 INITIAL_STATE")
 
+        # 性能优化：使用 msgspec.json.decode 替代 json.loads，速度更快
         json_str = matched.group(1).replace("undefined", "null")
-        return json.loads(json_str)
+        try:
+            return msgspec.json.decode(json_str)
+        except msgspec.DecodeError as e:
+            logger.error(f"JSON Decode Error: {e}")
+            raise ParseException("小红书数据解析异常")
 
 
 class Stream(Struct):
