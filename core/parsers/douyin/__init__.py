@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, ClassVar, Any
 from urllib.parse import urlparse
 
 import msgspec
-from aiohttp import TCPConnector
+from aiohttp import TCPConnector, ClientSession
 
 from astrbot.api import logger
 from ...config import PluginConfig
@@ -59,7 +59,10 @@ class DouyinParser(BaseParser):
         self._ttwid_lock = asyncio.Lock()
 
         # 优化连接池，提升整体速度
-        self.session.connector = TCPConnector(limit=20, ttl_dns_cache=300, keepalive_timeout=25)
+        if not hasattr(self.session, "_connector") or self.session._connector is None:
+            self.session._connector = TCPConnector(
+                limit=20, ttl_dns_cache=300, keepalive_timeout=25
+            )
 
         self._set_cookies()
 
