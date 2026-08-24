@@ -123,9 +123,59 @@ class DouyinParser(BaseParser):
             return
 
         logger.debug("[抖音] 当前缺少匿名 ttwid，尝试注册")
-        # ...（ensure_ttwid 逻辑保持不变，与原代码一致）
-        # （为节省篇幅此处省略，实际替换时请保留您当前文件中的 ensure_ttwid 完整实现）
-        # ...（从原代码 121 行到 173 行全部复制粘贴即可）
+        headers = self.ios_headers.copy()
+        headers.update(
+            {
+                "Content-Type": "application/json",
+                "Referer": "https://www.iesdouyin.com/",
+            }
+        )
+        payload = {
+            "region": "cn",
+            "aid": 1768,
+            "needFid": False,
+            "service": "www.iesdouyin.com",
+            "union": True,
+            "fid": "",
+        }
+        try:
+            async with self.session.post(
+                self.TTWID_REGISTER_URL,
+                json=payload,
+                headers=headers,
+            ) as resp:
+                if resp.status >= 400:
+                    raise ParseException(f"ttwid register status: {resp.status}")
+                set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+                self.cookiejar.update_from_response(set_cookie_headers)
+                self._set_cookies()
+                body = await resp.json(content_type=None)
+        except (ClientError, TimeoutError, ValueError) as e:
+            raise ParseException("ttwid register failed") from e
+
+        if not isinstance(body, dict):
+            raise ParseException("ttwid register returned invalid body")
+
+        if callback_url := body.get("redirect_url"):
+            callback_headers = self._sync_headers_for_url(callback_url)
+            callback_headers["Referer"] = "https://www.iesdouyin.com/"
+            try:
+                async with self.session.get(
+                    callback_url,
+                    headers=callback_headers,
+                    allow_redirects=False,
+                ) as resp:
+                    if resp.status >= 400:
+                        raise ParseException(f"ttwid callback status: {resp.status}")
+                    set_cookie_headers = resp.headers.getall("Set-Cookie", [])
+                    self.cookiejar.update_from_response(set_cookie_headers)
+                    self._set_cookies()
+            except (ClientError, TimeoutError) as e:
+                raise ParseException("ttwid callback failed") from e
+
+        if not self._has_ttwid():
+            raise ParseException("ttwid register returned no cookie")
+
 
     async def parse_with_redirect(self, url: str) -> "ParseResult":
         """先重定向再解析，并更新 cookies"""
