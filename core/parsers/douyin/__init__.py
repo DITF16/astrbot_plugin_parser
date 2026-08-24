@@ -17,7 +17,7 @@ from ..base import (
     Platform,
     handle,
 )
-from ..download import auto_task   # ← 正确导入位置
+from ...download import auto_task
 
 if TYPE_CHECKING:
     from ...data import ParseResult, Content
