@@ -144,21 +144,24 @@ class DouyinParser(BaseParser):
         return await self._official_parse(ty, vid)
 
     async def _race_parse(self, ty: str, vid: str) -> "ParseResult":
-        """保留竞速模式：官方与备用API谁快用谁"""
-        tasks = {
+        """竞速模式：等待第一个【成功】的结果"""
+        tasks = [
             asyncio.create_task(self._official_parse(ty, vid), name="official"),
             asyncio.create_task(self._backup_api_parse(vid), name="backup"),
-        }
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        ]
         
-        for task in pending:
-            task.cancel()
-            
-        for task in done:
-            if not task.exception():
-                return task.result()
-            logger.debug(f"[抖音] {task.get_name()} 路径失败: {task.exception()}")
-            
+        for coro in asyncio.as_completed(tasks):
+            try:
+                result = await coro
+                # 只要有一个成功，立刻取消还在跑的其他任务，节约资源
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                return result
+            except Exception as e:
+                logger.debug(f"[抖音] 某个竞速分支失败: {e}")
+                continue
+                
         raise ParseException("官方路径与备用API均解析失败")
 
     async def _official_parse(self, ty: str, vid: str) -> "ParseResult":
