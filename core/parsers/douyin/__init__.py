@@ -6,19 +6,18 @@ from typing import TYPE_CHECKING, ClassVar, Any
 from urllib.parse import urlparse
 
 import msgspec
-from aiohttp import ClientError, TCPConnector
+from aiohttp import TCPConnector
 
 from astrbot.api import logger
 from ...config import PluginConfig
 from ...cookie import CookieJar
 from ..base import (
     BaseParser,
-    Downloader,
     ParseException,
     Platform,
     handle,
-    auto_task,
 )
+from ..download import auto_task   # ← 正确导入位置
 
 if TYPE_CHECKING:
     from ...data import ParseResult, Content
@@ -37,19 +36,19 @@ class DouyinParser(BaseParser):
     
     PLAY_RATIOS: ClassVar[tuple[str, ...]] = ("1080p", "720p", "540p")
     
-    # 备用公开API（仅在官方路径失败时使用）
+    # 备用公开API（仅在官方路径失败或较慢时使用）
     BACKUP_APIS: ClassVar[list[str]] = [
         "https://api.douyin.wang/api/video",
         "https://api.douyin.wtf/api/video",
         "https://tikwm.com/api/",
     ]
 
-    def __init__(self, config: PluginConfig, downloader: Downloader):
+    def __init__(self, config: PluginConfig, downloader):
         super().__init__(config, downloader)
         self.mycfg = config.parser.douyin
         self.cookiejar = CookieJar(config, self.mycfg, domain="douyin.com")
         
-        # 可在 _conf_schema.json 和 default_template.json 中新增以下配置
+        # 可在 _conf_schema.json 和 default_template.json 中新增以下配置项
         self.use_race_mode: bool = getattr(self.mycfg, "use_race_mode", True)
         self.max_concurrent_parse: int = getattr(self.mycfg, "max_concurrent_parse", 3)
         self.download_chunk_size: int = getattr(self.mycfg, "download_chunk_size", 2 * 1024 * 1024)  # 2MB
@@ -59,7 +58,7 @@ class DouyinParser(BaseParser):
         self._ttwid_cache: str | None = None
         self._ttwid_lock = asyncio.Lock()
 
-        # 优化连接池，复用连接提升速度
+        # 优化连接池，提升整体速度
         self.session.connector = TCPConnector(limit=20, ttl_dns_cache=300, keepalive_timeout=25)
 
         self._set_cookies()
@@ -126,7 +125,7 @@ class DouyinParser(BaseParser):
             return await self._official_parse(vid)
 
     async def _race_parse(self, vid: str) -> "ParseResult":
-        """并行竞速：官方路径 vs 备用API，谁先成功用谁（速度优先）"""
+        """并行竞速模式：官方路径 vs 备用API，谁先成功用谁（速度优先）"""
         tasks = {
             asyncio.create_task(self._official_parse(vid), name="official"),
             asyncio.create_task(self._backup_api_parse(vid), name="backup"),
@@ -246,7 +245,7 @@ class DouyinParser(BaseParser):
     async def _probe_single_ratio(self, video_id: str, ratio: str, referer: str) -> ProbedVideo | None:
         url = f"https://aweme.snssdk.com/aweme/v1/play/?video_id={video_id}&ratio={ratio}"
         headers = self.ios_headers.copy()
-        headers.update({"Referer": referer, "Range": "bytes=0-2097152"})  # 2MB 加速判断
+        headers.update({"Referer": referer, "Range": "bytes=0-2097152"})
 
         try:
             async with self.session.get(url, headers=headers, allow_redirects=True, timeout=8) as resp:
@@ -277,7 +276,7 @@ class DouyinParser(BaseParser):
         return await self.parse(keyword, searched)
 
     async def parse_slides(self, video_id: str):
-        """图集解析（保持原逻辑不变）"""
+        """图集解析（保持与原插件完全一致）"""
         url = "https://www.iesdouyin.com/web/api/v2/aweme/slidesinfo/"
         params = {
             "aweme_ids": f"[{video_id}]",
@@ -340,7 +339,7 @@ class DouyinParser(BaseParser):
                 content.path,
                 headers=content.headers or self.ios_headers,
                 timeout=35,
-                chunk_size=self.download_chunk_size,   # 2MB 平衡速度与内存
+                chunk_size=self.download_chunk_size,
             )
             logger.debug(f"[抖音] 下载完成 → {content.path.name}")
         except Exception as e:
